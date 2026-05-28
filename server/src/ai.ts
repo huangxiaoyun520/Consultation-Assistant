@@ -117,7 +117,7 @@ export class AiService {
       "case draft",
       [
         "你是临床示教课问诊训练助手。根据匿名问诊记录生成中文结构化病历草稿。",
-        "不得编造未采集信息；未知内容写“待补充”。不提供处方或治疗方案。",
+        "不得编造未采集信息；未知内容写\u201c待补充\u201d。不提供处方或治疗方案。",
         "只返回 JSON，字段包括 chiefComplaint、historyOfPresentIllness、pastHistory、personalHistory、maritalMenstrualOrObstetricHistory、familyHistory、physicalExamPlaceholder、auxiliaryExamPlaceholder、assessment、differentialDiagnosis、missingInformation、disclaimer。"
       ].join("\n"),
       `请根据以下匿名病例资料生成结构化病历草稿 JSON。\n\n病例资料：\n${JSON.stringify(compactContext(context), null, 2)}`
@@ -137,37 +137,46 @@ export class AiService {
 
   private async safeJson(label: string, system: string, input: string): Promise<unknown> {
     this.assertConfigured();
-    try {
-      const request: Record<string, unknown> = {
-        model: this.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: input }
-        ],
-        stream: false
-      };
-      if (!isDeepSeekModel(this.model)) {
-        request.response_format = { type: "json_object" };
+    const maxRetries = 2;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const request: Record<string, unknown> = {
+          model: this.model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: input }
+          ],
+          stream: false
+        };
+        if (!isDeepSeekModel(this.model)) {
+          request.response_format = { type: "json_object" };
+        }
+        const completion = await this.client!.chat.completions.create(request as never, {
+          timeout: 12000
+        });
+        const content = completion.choices[0]?.message?.content ?? "";
+        return JSON.parse(extractJson(content));
+      } catch (error) {
+        if (attempt === maxRetries) {
+          console.warn(`AI ${label} failed after ${maxRetries + 1} attempts:`, error);
+          throw Object.assign(new Error("AI 服务调用失败，请稍后重试。"), { statusCode: 502 });
+        }
+        console.warn(`AI ${label} attempt ${attempt + 1} failed, retrying:`, error);
       }
-      const completion = await this.client!.chat.completions.create(request as never);
-      const content = completion.choices[0]?.message?.content ?? "";
-      return JSON.parse(extractJson(content));
-    } catch (error) {
-      console.warn(`AI ${label} failed:`, error);
-      throw Object.assign(new Error("AI 服务调用失败，请稍后重试。"), { statusCode: 502 });
     }
+    throw Object.assign(new Error("AI 服务调用失败，请稍后重试。"), { statusCode: 502 });
   }
 }
 
 function isDeepSeekModel(model: string) {
-  return model.toLowerCase().startsWith("deepseek-");
+  return model.toLowerCase().includes("deepseek");
 }
 
 function extractJson(content: string) {
   const trimmed = content.trim();
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) return trimmed;
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) return fenced[1].trim();
+  if (fenced?.[1]) return fenced[1];
   const first = trimmed.indexOf("{");
   const last = trimmed.lastIndexOf("}");
   if (first >= 0 && last > first) return trimmed.slice(first, last + 1);
