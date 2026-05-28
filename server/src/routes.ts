@@ -33,22 +33,22 @@ const resolveSuggestionSchema = z.object({
 const participantSchema = z.object({ participantId: z.string().min(1) });
 
 export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiService, broadcast: (code: string) => void) {
+  // Set prevents concurrent AI generation for the same session
   const generatingSessions = new Set<string>();
 
   function maybeGenerateInBackground(code: string, participantId?: string) {
     const snapshot = db.snapshotByCode(code, participantId);
-    const answeredCount = snapshot.questions.filter((question) => question.status === "answered").length;
-    const openCount = snapshot.questions.filter((question) => question.status === "pending").length;
+    const answeredCount = snapshot.questions.filter((q) => q.status === "answered").length;
+    const openCount = snapshot.questions.filter((q) => q.status === "pending").length;
     const targetOpenQuestions = 3;
     if (answeredCount >= 8 || openCount >= targetOpenQuestions || generatingSessions.has(snapshot.session.id)) return;
 
     generatingSessions.add(snapshot.session.id);
     app.log.info({ code }, "AI background question generation started");
-    void ai
-      .nextQuestions(snapshot)
+    ai.nextQuestions(snapshot)
       .then((questions) => {
-        const existing = new Set(db.snapshotByCode(code).questions.map((question) => question.text));
-        const fresh = questions.filter((question) => !existing.has(question.text)).slice(0, targetOpenQuestions - openCount);
+        const existing = new Set(db.snapshotByCode(code).questions.map((q) => q.text));
+        const fresh = questions.filter((q) => !existing.has(q.text)).slice(0, targetOpenQuestions - openCount);
         if (fresh.length) {
           db.addQuestions(snapshot.session.id, fresh, "ai");
           db.saveInsight(snapshot.session.id, "next_questions", "background refill", { questions: fresh });
@@ -81,36 +81,32 @@ export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiServ
     const body = initializeSchema.parse(request.body);
     assertPrivacy([body.suspectedDisease, body.chiefComplaint, body.backgroundSummary]);
     const session = db.initializeSession(code, body);
-    const context = { ...db.snapshotByCode(code), session };
-    const questions = await ai.nextQuestions(context);
+    // Fetch snapshot once; reuse it instead of calling snapshotByCode again below
+    const snapshot = db.snapshotByCode(code);
+    const questions = await ai.nextQuestions(snapshot);
     if (questions.length) {
       db.addQuestions(session.id, questions, "ai");
       db.saveInsight(session.id, "next_questions", JSON.stringify(body), { questions });
     }
-    const snapshot = db.snapshotByCode(code);
     broadcast(code);
-    return snapshot;
+    return db.snapshotByCode(code);
   });
 
   app.post("/api/sessions/:code/answers", async (request) => {
     const { code } = codeSchema.parse(request.params);
     const body = answerSchema.parse(request.body);
     assertPrivacy([body.note]);
-    const snapshot = db.updateAnswer(code, body.participantId, body.questionId, body.status, body.note);
-    broadcast(code);
+    db.updateAnswer(code, body.participantId, body.questionId, body.status, body.note);
     maybeGenerateInBackground(code, body.participantId);
-    const next = db.snapshotByCode(code, body.participantId);
-    broadcast(code);
-    return next;
+    return db.snapshotByCode(code, body.participantId);
   });
 
   app.post("/api/sessions/:code/questions/skip", async (request) => {
     const { code } = codeSchema.parse(request.params);
     const body = skipSchema.parse(request.body);
-    const snapshot = db.skipQuestion(code, body.participantId, body.questionId);
-    broadcast(code);
+    db.skipQuestion(code, body.participantId, body.questionId);
     maybeGenerateInBackground(code, body.participantId);
-    return snapshot;
+    return db.snapshotByCode(code, body.participantId);
   });
 
   app.post("/api/sessions/:code/next-questions", async (request) => {
@@ -125,9 +121,8 @@ export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiServ
       db.addQuestions(snapshot.session.id, questions, "ai");
       db.saveInsight(snapshot.session.id, "next_questions", "next step", { questions });
     }
-    const next = db.snapshotByCode(code, participantId);
     broadcast(code);
-    return next;
+    return db.snapshotByCode(code, participantId);
   });
 
   app.post("/api/sessions/:code/suggestions", async (request) => {
@@ -135,18 +130,18 @@ export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiServ
     const body = suggestionSchema.parse(request.body);
     assertPrivacy([body.text, body.reason]);
     db.addSuggestion(code, body.participantId, body.text, body.reason);
-    const snapshot = db.snapshotByCode(code, body.participantId);
     broadcast(code);
-    return snapshot;
+    return db.snapshotByCode(code, body.participantId);
   });
 
   app.post("/api/sessions/:code/suggestions/:suggestionId/resolve", async (request) => {
-    const { code } = codeSchema.parse(request.params);
-    const { suggestionId } = z.object({ suggestionId: z.string() }).parse(request.params);
+    const { code, suggestionId } = z.object({
+      code: z.string(), suggestionId: z.string()
+    }).parse(request.params);
     const body = resolveSuggestionSchema.parse(request.body);
-    const snapshot = db.resolveSuggestion(code, body.participantId, suggestionId, body.status);
+    db.resolveSuggestion(code, body.participantId, suggestionId, body.status);
     broadcast(code);
-    return snapshot;
+    return db.snapshotByCode(code, body.participantId);
   });
 
   app.post("/api/sessions/:code/differential", async (request) => {
@@ -158,9 +153,8 @@ export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiServ
     }
     const result = await ai.differential(snapshot);
     db.saveInsight(snapshot.session.id, "differential", "current facts", result);
-    const next = db.snapshotByCode(code, participantId);
     broadcast(code);
-    return next;
+    return db.snapshotByCode(code, participantId);
   });
 
   app.post("/api/sessions/:code/case-draft", async (request) => {
@@ -173,9 +167,8 @@ export function registerRoutes(app: FastifyInstance, db: AppDatabase, ai: AiServ
     const draft = await ai.caseDraft(snapshot);
     db.saveInsight(snapshot.session.id, "case_draft", "full interview", draft);
     db.markSummarized(code);
-    const next = db.snapshotByCode(code, participantId);
     broadcast(code);
-    return next;
+    return db.snapshotByCode(code, participantId);
   });
 
   app.get("/api/sessions/:code/export.md", async (request, reply) => {
