@@ -101,7 +101,7 @@ function App() {
 
   useEffect(() => {
     if (!code) return;
-    let socket: Socket | null = io("/", { transports: ["websocket", "polling"] });
+    let socket: Socket | null = io("/", { reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 10000, reconnectionAttempts: Infinity, transports: ["websocket", "polling"] });
     socket.emit("session:join", { code, participantId });
     socket.on("session:updated", (next: SessionSnapshot) => {
       if (next.questions.length > questionCountRef.current) {
@@ -111,6 +111,8 @@ function App() {
       setSnapshot((current) => ({ ...next, participant: current?.participant ?? next.participant }));
     });
     socket.on("session:invalidated", () => setError("会话已失效或过期。"));
+    socket.on("connect_error", () => setError("连接已断开，正在重连..."));
+    socket.on("disconnect", () => setError("连接已断开，正在重连..."));
     return () => {
       socket?.disconnect();
       socket = null;
@@ -169,7 +171,7 @@ function App() {
         onAnswer={(questionId, status, note) =>
           {
             setAiGenerating(true);
-            window.setTimeout(() => setAiGenerating(false), 45000);
+            window.setTimeout(() => setAiGenerating(false), 90000);
             run(
             () =>
               api<SessionSnapshot>(`/api/sessions/${snapshot.session.code}/answers`, {
@@ -182,7 +184,7 @@ function App() {
         }
         onSkip={(questionId) => {
           setAiGenerating(true);
-          window.setTimeout(() => setAiGenerating(false), 45000);
+          window.setTimeout(() => setAiGenerating(false), 90000);
           run(
             () =>
               api<SessionSnapshot>(`/api/sessions/${snapshot.session.code}/questions/skip`, {
